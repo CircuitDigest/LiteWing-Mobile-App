@@ -6,6 +6,7 @@ import 'package:network_info_plus/network_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'drone_comm.dart'; // Import the DroneComm class
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:audioplayers/audioplayers.dart';
 
 class DroneControlScreen extends StatefulWidget {
   const DroneControlScreen({Key? key}) : super(key: key);
@@ -16,6 +17,7 @@ class DroneControlScreen extends StatefulWidget {
 
 class _DroneControlScreenState extends State<DroneControlScreen> {
   final DroneComm _droneComm = DroneComm(); // Instantiate DroneComm
+  final AudioPlayer _audioPlayer = AudioPlayer();
   Timer? _commandTimer; // Timer for sending commands
   Timer? _armingTimer; // Timer for arming sequence
   Timer? _throttleDecayTimer; // Timer for gradual throttle decay
@@ -58,12 +60,22 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   bool _isThrottleDecaying = false; // Whether throttle is currently decaying
   DateTime? _thrustReleaseTime; // When the joystick was released
 
+  double? _batteryVoltage;
+
   @override
   void initState() {
     super.initState();
     _fetchSSID();
     _loadTrimValues();
     _loadExpoExponent();
+    // Register voltage callback (always)
+    _droneComm.onVoltageUpdate = (double voltage) {
+      if (mounted) {
+        setState(() {
+          _batteryVoltage = voltage;
+        });
+      }
+    };
   }
 
   @override
@@ -128,7 +140,42 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
     }
   }
 
+  Future<void> _playConnectSound() async {
+    await _audioPlayer.play(AssetSource('sounds/connected.mp3'), volume: 1.0);
+  }
+
+  Future<void> _playDisconnectSound() async {
+    await _audioPlayer.play(AssetSource('sounds/disconnected.mp3'), volume: 1.0);
+  }
+
+  void _requestImmediateVoltage() {
+    // Request a single voltage reading immediately
+    _droneComm.requestSingleVoltageReading();
+  }
+
   Future<void> _handleConnectDisconnect() async {
+    // Set up connection status callback for heartbeat
+    _droneComm.onConnectionStatusChange = (bool isConnected) {
+      if (mounted) {
+        setState(() {
+          connected = isConnected;
+        });
+        _addDebug(isConnected ? 'Drone connection verified (heartbeat)' : 'Drone connection lost (heartbeat)');
+        if (isConnected) {
+          _droneComm.startVoltageMonitoring();
+          _requestImmediateVoltage(); // Request voltage immediately upon connection
+          _playConnectSound();
+        } else {
+          _droneComm.stopVoltageMonitoring();
+          _playDisconnectSound();
+          setState(() {
+            _batteryVoltage = null;
+            _isArmed = false; // Reset armed state
+          });
+        }
+      }
+    };
+
     if (connected) {
       // Handle Disconnect
       _stopSendingCommands();
@@ -227,6 +274,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           timer.cancel();
           _isArmed = true;
           _addDebug("Arming complete! Motors ready for thrust.");
+          _requestImmediateVoltage(); // Request voltage immediately after arming
           _startRegularCommands();
           return;
         }
@@ -379,14 +427,69 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         mainAxisSize: MainAxisSize.min,
-        children: debugLines.map((line) => 
-          Text(line, 
-            style: const TextStyle(color: Colors.white, fontSize: 12),
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          )
-        ).toList(),
+        children: [
+          ...debugLines.map((line) => 
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 0.5),
+              child: Text(line, 
+                style: const TextStyle(color: Colors.white70, fontSize: 8),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                textAlign: TextAlign.center,
+              ),
+            )
+          ),
+          SizedBox(height: 8),
+          _buildBatteryDisplay(),
+        ],
       ),
+    );
+  }
+
+  Widget _buildBatteryDisplay() {
+    IconData batteryIcon;
+    Color iconColor;
+    Color textColor;
+    final voltage = _batteryVoltage;
+    if (voltage == null) {
+      batteryIcon = Icons.battery_unknown;
+      iconColor = Colors.white;
+      textColor = Colors.grey;
+    } else if (voltage >= 4.0) {
+      batteryIcon = Icons.battery_full;
+      iconColor = voltage < 3.8 ? Colors.red : Colors.white;
+      textColor = voltage < 3.8 ? Colors.red : Colors.grey;
+    } else if (voltage >= 3.8) {
+      batteryIcon = Icons.battery_5_bar;
+      iconColor = Colors.white;
+      textColor = Colors.grey;
+    } else if (voltage >= 3.6) {
+      batteryIcon = Icons.battery_3_bar;
+      iconColor = Colors.red;
+      textColor = Colors.red;
+    } else if (voltage >= 3.4) {
+      batteryIcon = Icons.battery_2_bar;
+      iconColor = Colors.red;
+      textColor = Colors.red;
+    } else {
+      batteryIcon = Icons.battery_1_bar;
+      iconColor = Colors.red;
+      textColor = Colors.red;
+    }
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(batteryIcon, color: iconColor, size: 20),
+        const SizedBox(width: 4),
+        Text(
+          voltage != null ? '${voltage.toStringAsFixed(2)} V' : '--',
+          style: TextStyle(
+            color: textColor,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
     );
   }
 
@@ -472,18 +575,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                     painter: JoystickGridPainter(),
                     size: Size.infinite,
                   ),
-                  // Center point indicator - bigger
-                  Center(
-                    child: Container(
-                      width: 16,
-                      height: 16,
-                      decoration: BoxDecoration(
-                        color: Colors.white.withOpacity(0.8),
-                        shape: BoxShape.circle,
-                        border: Border.all(color: Colors.white, width: 1),
-                      ),
-                    ),
-                  ),
+                  // No center dot - removed as requested
                   // Joystick position indicator - always visible, moves from center based on drag
                   Positioned.fill(
                     child: LayoutBuilder(
@@ -504,12 +596,22 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                           child: Transform.translate(
                             offset: Offset(offsetX, offsetY),
                             child: Container(
-                              width: 40,
-                              height: 40,
+                              width: 45,
+                              height: 45,
                               decoration: BoxDecoration(
-                                color: Colors.white.withOpacity(0.6),
+                                color: Colors.grey[600],
                                 shape: BoxShape.circle,
-                                border: Border.all(color: Colors.white, width: 2),
+                                border: Border.all(
+                                  color: Colors.grey[400]!,
+                                  width: 2,
+                                ),
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.black.withOpacity(0.3),
+                                    blurRadius: 4,
+                                    offset: Offset(0, 2),
+                                  ),
+                                ],
                               ),
                             ),
                           ),
@@ -703,8 +805,8 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 child: Container(
                   width: MediaQuery.of(context).size.width * 0.8,
                   height: MediaQuery.of(context).size.height,
-                                     decoration: const BoxDecoration(
-                     color: Colors.black,
+                                     decoration: BoxDecoration(
+                     color: Colors.grey[900],
                    ),
                   child: Column(
                     children: [
@@ -749,7 +851,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                             children: [
                               _buildTrimSlider(
                                 label: 'Roll Trim',
-                                description: 'Compensates for left/right drift when joystick is centered',
+                                description: 'Increase if drone drifts left • Decrease if drone drifts right',
                                 value: rollTrim,
                                 onChanged: (v) {
                                   setState(() => rollTrim = v);
@@ -763,7 +865,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                               const SizedBox(height: 12),
                               _buildTrimSlider(
                                 label: 'Pitch Trim',
-                                description: 'Compensates for forward/backward drift when joystick is centered',
+                                description: 'Increase if drone drifts backward • Decrease if drone drifts forward',
                                 value: pitchTrim,
                                 onChanged: (v) {
                                   setState(() => pitchTrim = v);
@@ -1106,6 +1208,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                           fontSize: 10,
                                           fontWeight: FontWeight.w600,
                                         ),
+
                                       ),
                                       Text(
                                         '${_getActualThrustPercentage()}%',
@@ -1126,6 +1229,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                           fontSize: 10,
                                           fontWeight: FontWeight.w600,
                                         ),
+
                                       ),
                                       Text(
                                         '${_getActualYawValue().toStringAsFixed(0)}°/s',
@@ -1176,34 +1280,41 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                           ],
                         ),
                       ),
-                      // Center Debug Area - Minimal
+                      // Center Debug Area - Debug + Battery
                       Expanded(
                         flex: 1,
                         child: Center(
-                        child: Container(
-                            width: 120,
-                            height: 60,
-                            padding: const EdgeInsets.all(4.0),
-                            decoration: BoxDecoration(
-                              color: Colors.black.withOpacity(0.6),
-                              borderRadius: BorderRadius.circular(6.0),
-                              border: Border.all(color: Colors.grey[700]!, width: 1),
-                            ),
-                            child: Column(
-                              mainAxisSize: MainAxisSize.min,
-                              crossAxisAlignment: CrossAxisAlignment.center,
-                              children: debugLines.take(3).map((line) => 
-                                Padding(
-                                  padding: const EdgeInsets.symmetric(vertical: 0.5),
-                                  child: Text(line, 
-                                    style: const TextStyle(color: Colors.white70, fontSize: 8),
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    textAlign: TextAlign.center,
-                                  ),
-                                )
-                              ).toList(),
-                            ),
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 150,
+                                height: 80,
+                                padding: const EdgeInsets.all(4.0),
+                                decoration: BoxDecoration(
+                                  color: Colors.black.withOpacity(0.6),
+                                  borderRadius: BorderRadius.circular(6.0),
+                                  border: Border.all(color: Colors.grey[700]!, width: 1),
+                                ),
+                                child: Column(
+                                  mainAxisSize: MainAxisSize.min,
+                                  crossAxisAlignment: CrossAxisAlignment.center,
+                                  children: debugLines.take(3).map((line) => 
+                                    Padding(
+                                      padding: const EdgeInsets.symmetric(vertical: 0.5),
+                                      child: Text(line, 
+                                        style: const TextStyle(color: Colors.white70, fontSize: 10),
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        textAlign: TextAlign.center,
+                                      ),
+                                    )
+                                  ).toList(),
+                                ),
+                              ),
+                              const SizedBox(height: 8),
+                              _buildBatteryDisplay(),
+                            ],
                           ),
                         ),
                       ),
@@ -1227,6 +1338,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                           fontSize: 10,
                                           fontWeight: FontWeight.w600,
                                         ),
+
                                       ),
                                       Text(
                                         '${_getActualRollValue().toStringAsFixed(0)}°',
@@ -1247,6 +1359,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                           fontSize: 10,
                                           fontWeight: FontWeight.w600,
                                         ),
+
                                       ),
                                       Text(
                                         '${_getActualPitchValue().toStringAsFixed(0)}°',
@@ -1312,7 +1425,6 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 ),
               ),
             ),
-
           ],
         ),
       ),
@@ -1329,16 +1441,17 @@ class JoystickGridPainter extends CustomPainter {
       ..style = PaintingStyle.stroke;
 
     final center = Offset(size.width / 2, size.height / 2);
+    final crosshairLength = math.min(size.width, size.height) * 0.4; // Further increased size
     
-    // Draw crosshair
+    // Draw shorter crosshair
     canvas.drawLine(
-      Offset(0, center.dy),
-      Offset(size.width, center.dy),
+      Offset(center.dx - crosshairLength, center.dy),
+      Offset(center.dx + crosshairLength, center.dy),
       paint,
     );
     canvas.drawLine(
-      Offset(center.dx, 0),
-      Offset(center.dx, size.height),
+      Offset(center.dx, center.dy - crosshairLength),
+      Offset(center.dx, center.dy + crosshairLength),
       paint,
     );
     
@@ -1353,3 +1466,5 @@ class JoystickGridPainter extends CustomPainter {
   @override
   bool shouldRepaint(CustomPainter oldDelegate) => false;
 }
+
+

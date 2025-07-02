@@ -71,6 +71,16 @@ CRTP_PORT_SETPOINT_GENERIC = 0x07  // Advanced flight commands
 CRTP_PORT_SETPOINT_HL      = 0x08  // High-level commands
 ```
 
+### Best Practices
+- All packets: `[size][header][data...][checksum]`
+  - `size`: Number of bytes in data (excluding header and checksum)
+  - `header`: (port << 4) | channel
+  - `data`: Payload (log config, param, setpoint, etc.)
+  - `checksum`: Sum of all previous bytes (mod 256)
+- Always use the TOC to discover variable IDs/types for log/param operations.
+- For log/telemetry, use port 0x05; for parameters, use port 0x02; for setpoints, use port 0x03 or 0x07.
+- Follow the handshake and sequence as observed in cfclient/cflib for maximum compatibility.
+
 ---
 
 ## 3. Flight Control Commands
@@ -162,6 +172,33 @@ Enable altitude hold by setting flight mode:
 // Send parameter: "flightmode.althold" = 1
 ```
 
+### How to Activate Height Hold Mode from the Mobile App
+
+#### Step-by-Step:
+1. **Set the parameter `flightmode.althold` to 1** using the parameter system (CRTP port 0x02).
+2. (Optional) **Send an advanced setpoint command** to port 0x07 for altitude/zDistance control.
+
+#### Example (Pseudocode/JS):
+```javascript
+// 1. Set parameter to enable height hold
+setParameter('flightmode.althold', 1); // Port 0x02, Channel 1
+
+// 2. (Optional) Send altHold command for advanced control
+const packet = new ArrayBuffer(17);
+const view = new DataView(packet);
+view.setUint8(0, 4); // altHoldType
+view.setFloat32(1, roll, true);
+view.setFloat32(5, pitch, true);
+view.setFloat32(9, yawRate, true);
+view.setFloat32(13, zVel, true);
+sendCRTPPacket(0x07, 0, new Uint8Array(packet));
+```
+
+#### Notes:
+- Setting `flightmode.althold` to 1 enables altitude hold mode in the drone firmware.
+- You can toggle this parameter to enable/disable height hold as needed.
+- For full position/altitude control, use the advanced setpoint packet as shown.
+
 ---
 
 ## 5. Parameter System
@@ -252,6 +289,43 @@ function startLogStream(variables, frequency) {
 // Example: Stream attitude at 50Hz
 startLogStream(['stabilizer.roll', 'stabilizer.pitch', 'stabilizer.yaw'], 50);
 ```
+
+### How to Read Battery Voltage (pm.vbat) from the Drone
+
+#### Step-by-Step (as in cflib/cfclient):
+1. **Perform the initial handshake** (see Section 1 for handshake sequence).
+2. **Fetch the Table of Contents (TOC)** from the drone to discover available log variables.
+3. **Create a LogConfig** for the variable(s) you want to log (e.g., "pm.vbat").
+4. **Add the LogConfig to the drone** and start it.
+5. **Register a callback** to receive log data packets and extract the battery voltage.
+
+#### Example (Pseudocode/JS):
+```javascript
+// 1. Handshake and connect to drone (see Section 1)
+
+// 2. Fetch TOC (send TOC_INFO request to port 0x05, channel 0)
+//    Parse TOC responses to find the ID/type for 'pm.vbat'
+
+// 3. Create log block for 'pm.vbat' (use correct ID/type from TOC)
+const logBlock = createLogBlock(['pm.vbat'], 100); // 100ms period
+sendCRTPPacket(0x05, 1, logBlock); // Port 0x05, Channel 1 (settings)
+
+// 4. Start log block
+sendCRTPPacket(0x05, 1, startLogBlockCommand(logBlock.id));
+
+// 5. Listen for log data packets (port 0x05, channel 2)
+socket.on('data', (packet) => {
+  if (isLogDataPacket(packet)) {
+    const vbat = parseVbatFromPacket(packet);
+    displayBatteryVoltage(vbat);
+  }
+});
+```
+
+#### Notes:
+- The log block creation and start commands must use the variable ID/type as discovered in the TOC.
+- Log data packets will contain the block ID, timestamp, and variable values in the order requested.
+- Use the TOC to parse the log data correctly.
 
 ---
 
@@ -615,3 +689,30 @@ class CRTPProtocol {
 - **Connection Monitor**: Detect and handle disconnections
 
 This documentation provides everything needed to build a comprehensive mobile application for controlling your LiteWing drone via WiFi, with special focus on implementing height hold functionality! 
+
+
+Dart Implementation Strategy for finding drone with height hold sensor:
+
+. Parameter 0x02 (Sensor Configuration):
+
+Height Hold Drone: 2d 02 00 00 01 30 (5th byte = 0x01)
+No Height Hold: 2d 02 00 00 00 2f (5th byte = 0x00)
+
+Add this to your Dart connection code after initial handshake:
+
+dartFuture<bool> detectHeightSensor() async {
+  // Request parameter 0x02 (sensor config)
+  await _sendPacket([0x2d, 0x02, 0x00, 0x2f]);
+  await Future.delayed(Duration(milliseconds: 100));
+  
+  // Check response: 2d 02 00 00 XX YY
+  // If XX = 0x01, height sensor is present
+  
+  // Optional: Also check parameter 0xA3 for deck confirmation
+  await _sendPacket([0x2d, 0xa3, 0x00, 0xd0]);
+  await Future.delayed(Duration(milliseconds: 100));
+  
+  return heightSensorDetected;
+}
+
+This  means you can automatically detect whether a Crazyflie has height hold capabilities just by checking these parameter responses during the connection handshake!

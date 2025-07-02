@@ -21,6 +21,11 @@ class DroneComm {
   double? _lastVoltage;
   Function(double voltage)? onVoltageUpdate;
 
+  // --- Height Sensor Detection ---
+  bool? _heightSensorDetected;
+  Completer<bool>? _heightDetectionCompleter;
+  Function(bool hasHeightSensor)? onHeightSensorDetected;
+
   Future<void> connect() async {
     try {
       _droneIp = InternetAddress('192.168.43.42');
@@ -71,6 +76,70 @@ class DroneComm {
     }
   }
 
+  // --- Height Sensor Detection ---
+  Future<bool> detectHeightSensor() async {
+    if (_socket == null || _droneIp == null) {
+      print('DroneComm: Cannot detect height sensor - socket not ready');
+      return false;
+    }
+    
+    // Always reset detection state completely
+    _heightSensorDetected = null;
+    
+    // Safely complete any pending detection first
+    if (_heightDetectionCompleter != null) {
+      if (!_heightDetectionCompleter!.isCompleted) {
+        try {
+          _heightDetectionCompleter!.complete(false);
+        } catch (e) {
+          print('DroneComm: Error completing previous detection: $e');
+        }
+      }
+      _heightDetectionCompleter = null;
+    }
+    
+    // Create new completer
+    _heightDetectionCompleter = Completer<bool>();
+    
+    try {
+      print('DroneComm: Starting height sensor detection...');
+      
+      // Try multiple detection attempts for reliability
+      for (int attempt = 1; attempt <= 3; attempt++) {
+        print('DroneComm: Detection attempt $attempt/3');
+        
+        // Send parameter discovery packet for height sensor
+        var heightDetectionPacket = [0x2d, 0x02, 0x00, 0x2f];
+        _socket!.send(Uint8List.fromList(heightDetectionPacket), _droneIp!, _dronePort);
+        print('DroneComm: Sent detection packet: [${heightDetectionPacket.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+        
+        // Wait between attempts
+        if (attempt < 3) {
+          await Future.delayed(const Duration(milliseconds: 500));
+        }
+      }
+      
+      // Wait for response with timeout
+      bool result = await _heightDetectionCompleter!.future.timeout(
+        const Duration(seconds: 5), // Increased timeout
+        onTimeout: () {
+          print('DroneComm: Height sensor detection timeout after 5 seconds');
+          return false;
+        },
+      );
+      
+      print('DroneComm: Final detection result: $result');
+      return result;
+      
+    } catch (e) {
+      print('DroneComm: Error detecting height sensor: $e');
+      return false;
+    } finally {
+      // Clean up completer
+      _heightDetectionCompleter = null;
+    }
+  }
+
   // --- Existing Heartbeat/Ping Monitoring ---
   void _startConnectionMonitoring() {
     _pingTimer?.cancel();
@@ -99,9 +168,16 @@ class DroneComm {
 
   void _parseIncomingPacket(Uint8List data) {
     if (data.isEmpty) return;
+    
+    // Print all incoming packets for debugging height sensor detection
+    if (data.length >= 3 && data[0] == 0x2d) {
+      print('DroneComm: Received parameter packet: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+    }
+    
     int header = data[0];
     int port = (header >> 4) & 0x0F;
     int channel = header & 0x0F;
+    
     // Heartbeat response
     if (port == 15 && channel == 13) {
       _lastPingResponse = DateTime.now();
@@ -113,6 +189,10 @@ class DroneComm {
     // Voltage data (Port 5, Channel 2)
     if (port == 5 && channel == 2 && data.length >= 10) {
       _parseVoltageData(data);
+    }
+    // Height sensor parameter response - check for multiple possible formats
+    if (data.length >= 5 && data[0] == 0x2d && data[1] == 0x02) {
+      _parseHeightSensorResponse(data);
     }
   }
 
@@ -134,6 +214,56 @@ class DroneComm {
     }
   }
 
+  void _parseHeightSensorResponse(Uint8List data) {
+    try {
+      print('DroneComm: Processing height sensor response: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+      
+      // Expected format: [0x2d, 0x02, 0x00, 0x00, sensor_status, ...]
+      // But also handle variations in response format
+      if (data.length >= 5) {
+        int sensorStatus = data[4];
+        bool hasHeightSensor = sensorStatus == 0x01;
+        
+        print('DroneComm: Height sensor status byte: 0x${sensorStatus.toRadixString(16).padLeft(2, '0')} = ${hasHeightSensor ? "DETECTED" : "NOT FOUND"}');
+        
+        _heightSensorDetected = hasHeightSensor;
+        
+        // Complete the detection future safely
+        if (_heightDetectionCompleter != null && !_heightDetectionCompleter!.isCompleted) {
+          print('DroneComm: Completing height sensor detection with result: $hasHeightSensor');
+          try {
+            _heightDetectionCompleter!.complete(hasHeightSensor);
+          } catch (e) {
+            print('DroneComm: Error completing detection: $e');
+          }
+        } else {
+          print('DroneComm: Detection completer is null or already completed');
+        }
+        
+        // Notify callback
+        if (onHeightSensorDetected != null) {
+          try {
+            onHeightSensorDetected!(hasHeightSensor);
+          } catch (e) {
+            print('DroneComm: Error in height sensor callback: $e');
+          }
+        }
+      } else {
+        print('DroneComm: Height sensor response too short: ${data.length} bytes');
+      }
+    } catch (e) {
+      print('DroneComm: Error parsing height sensor response: $e');
+      // Complete with false on error, but safely
+      if (_heightDetectionCompleter != null && !_heightDetectionCompleter!.isCompleted) {
+        try {
+          _heightDetectionCompleter!.complete(false);
+        } catch (completionError) {
+          print('DroneComm: Error completing detection on error: $completionError');
+        }
+      }
+    }
+  }
+
   void _checkConnectionTimeout() {
     if (_lastPingResponse != null && _isDroneConnected) {
       final timeSinceLastPing = DateTime.now().difference(_lastPingResponse!);
@@ -144,14 +274,29 @@ class DroneComm {
     }
   }
 
+  // --- Getters ---
+  bool? get heightSensorDetected => _heightSensorDetected;
+
   void close() {
     _pingTimer?.cancel();
     _pingTimer = null;
     _voltageTimer?.cancel();
     _voltageTimer = null;
+    
+    // Safely complete any pending detection
+    if (_heightDetectionCompleter != null && !_heightDetectionCompleter!.isCompleted) {
+      try {
+        _heightDetectionCompleter!.complete(false);
+      } catch (e) {
+        print('DroneComm: Error completing detection during close: $e');
+      }
+    }
+    _heightDetectionCompleter = null;
+    
     _socket?.close();
     _socket = null;
     _isDroneConnected = false;
+    _heightSensorDetected = null; // Reset detection state
   }
 
   List<int> createCommanderPacket({

@@ -29,7 +29,7 @@ packet = bytearray([
     *   `PITCH`: Degrees (e.g., a sensible range for joystick mapping might be -30.0 to +30.0 degrees). The value placed *in the packet* is inverted (see below).
     *   `YAW`: Degrees per second (e.g., a sensible range for joystick mapping might be -200.0 to +200.0 deg/s).
 *   **Scaling from Normalized Input:** If your application (e.g., UI with joysticks) produces normalized outputs (typically -1.0 to 1.0), these must be scaled to the appropriate degree/deg/s values before being used to construct the packet.
-    *   Example: `scaled_roll = joystick_roll_output[-1.0 to 1.0] * MAX_ROLL_ANGLE_DEGREES`
+    *   Example: `scaled_roll = joystick_roll_outpuRt[-1.0 to 1.0] * MAX_ROLL_ANGLE_DEGREES`
 *   **Pitch Inversion:** The `PITCH_BYTES` in the packet must contain the *inverted* pitch value. For example, if you want the drone to pitch nose down by 10 degrees (which might correspond to a positive logical pitch in your app depending on coordinate system), the value in the packet should be `-10.0`.
     *   If your application considers Joystick UP as positive pitch for nose DOWN, and your joystick output for UP is `+1.0` (after any app-level inversion of raw joystick Y data), this `+1.0` would be scaled (e.g., to `+30.0` degrees) and then inverted to `-30.0` for the packet.
 

@@ -1,10 +1,12 @@
 import 'dart:async'; // Added for Timer
 import 'dart:math' as math;
+import 'dart:typed_data'; // Added for ByteData
 import 'package:flutter/material.dart';
 import 'package:flutter_joystick/flutter_joystick.dart';
 import 'package:network_info_plus/network_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'drone_comm.dart'; // Import the DroneComm class
+// Removed height hold screen import - no longer needed
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:audioplayers/audioplayers.dart';
 
@@ -36,6 +38,17 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   double roll = 0.0;   // Joystick X: -1.0 to 1.0
   double pitch = 0.0;  // Joystick Y: -1.0 to 1.0 
   bool yawOn = false;
+  
+  // Height hold variables
+  bool _isHeightHoldActive = false;
+  bool _isLanding = false; // Track if drone is in landing sequence
+  bool _emergencyStopPressed = false; // Track if emergency stop was pressed
+  double _targetHeight = 0.3; // Current target height in meters
+  static const double MIN_HEIGHT = 0.2; // Minimum height (20cm)
+  static const double MAX_HEIGHT = 1.5; // Maximum height (150cm)
+  static const double HEIGHT_CHANGE_RATE = 1.0; // Height change rate (m/s)
+  static const double LANDING_RATE = 0.3; // Landing descent rate (m/s)
+  Timer? _landingTimer; // Timer for smooth landing
   double rollTrim = 0.0; // Added for roll trim
   double pitchTrim = 0.0; // Added for pitch trim
   List<String> debugLines = ["Welcome to LiteWing!", "Ready."];
@@ -82,6 +95,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   void dispose() {
     _stopSendingCommands();
     _throttleDecayTimer?.cancel();
+    _landingTimer?.cancel();
     _droneComm.close();
     super.dispose();
   }
@@ -135,7 +149,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
     if (mounted) {
       setState(() {
         debugLines.insert(0, msg); 
-        if (debugLines.length > 6) debugLines = debugLines.sublist(0, 6); 
+        if (debugLines.length > 10) debugLines = debugLines.sublist(0, 10); // Increased limit
       });
     }
   }
@@ -152,6 +166,264 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
     // Request a single voltage reading immediately
     _droneComm.requestSingleVoltageReading();
   }
+
+
+
+  void _toggleHeightHold() {
+    if (_isHeightHoldActive) {
+      // Start smooth landing sequence
+      _startSmoothLanding();
+    } else {
+      // Show popup to get target height
+      _showHeightInputDialog();
+    }
+  }
+  
+  void _startSmoothLanding() {
+    setState(() {
+      _isLanding = true;
+    });
+    
+    _addDebug("Starting smooth landing...");
+    _addDebug("Gradually reducing height to land safely");
+    
+    // Timer to gradually reduce height every 100ms
+    _landingTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
+      setState(() {
+        _targetHeight -= LANDING_RATE * 0.1; // Reduce by landing rate * 0.1s
+        
+        if (_targetHeight <= MIN_HEIGHT) {
+          // Landing complete
+          _targetHeight = MIN_HEIGHT;
+          timer.cancel();
+          
+          // Wait a moment at minimum height, then fully deactivate
+          Future.delayed(const Duration(seconds: 1), () {
+            setState(() {
+              _isHeightHoldActive = false;
+              _isLanding = false;
+            });
+            _addDebug("Landing complete - Height hold DEACTIVATED");
+            _addDebug("Back to normal manual flight");
+          });
+        }
+      });
+    });
+  }
+  
+  void _emergencyStop() {
+    // Cancel all timers
+    _landingTimer?.cancel();
+    _commandTimer?.cancel();
+    _throttleDecayTimer?.cancel();
+    
+    // Reset all states
+    setState(() {
+      _isHeightHoldActive = false;
+      _isLanding = false;
+      _isArmed = false;
+      _emergencyStopPressed = true; // Mark emergency stop as pressed
+      thrust = 0.0;
+      yaw = 0.0;
+      roll = 0.0;
+      pitch = 0.0;
+    });
+    
+    // Send zero thrust commands immediately
+    for (int i = 0; i < 5; i++) {
+      final List<int> stopPacket = _droneComm.createCommanderPacket(
+        roll: 0.0,
+        pitch: 0.0,
+        yaw: 0.0,
+        thrust: 0,
+      );
+      _droneComm.sendPacket(stopPacket);
+    }
+    
+    _addDebug("🚨 EMERGENCY STOP ACTIVATED 🚨");
+    _addDebug("All motors stopped immediately");
+    _addDebug("Restart connection to resume flight");
+    
+    // Restart command sending after a brief pause
+    Future.delayed(const Duration(milliseconds: 500), () {
+      if (connected && mounted) {
+        _startSendingCommands();
+      }
+    });
+    
+    // Reset emergency stop color after 3 seconds
+    Future.delayed(const Duration(seconds: 3), () {
+      if (mounted) {
+        setState(() {
+          _emergencyStopPressed = false;
+        });
+      }
+    });
+  }
+  
+  void _showHeightInputDialog() {
+    double selectedHeight = _targetHeight * 100; // Convert to cm
+    
+    showDialog(
+      context: context,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) => AlertDialog(
+          title: const Text('Set Target Height'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                'Target Height: ${selectedHeight.toStringAsFixed(0)} cm',
+                style: const TextStyle(
+                  fontSize: 18,
+                  fontWeight: FontWeight.bold,
+                  color: Colors.blue,
+                ),
+              ),
+              const SizedBox(height: 20),
+              Slider(
+                value: selectedHeight,
+                min: 20.0,
+                max: 150.0,
+                divisions: 26, // 20,25,30...150 (5cm steps)
+                label: '${selectedHeight.toStringAsFixed(0)} cm',
+                activeColor: Colors.blue,
+                onChanged: (value) {
+                  setDialogState(() {
+                    selectedHeight = (value / 5).round() * 5.0; // Round to nearest 5cm
+                  });
+                },
+              ),
+              const SizedBox(height: 10),
+              const Text(
+                '20 cm - 150 cm range',
+                style: TextStyle(
+                  fontSize: 12,
+                  color: Colors.grey,
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _startHeightHoldWithCountdown(selectedHeight);
+              },
+              child: const Text('Start'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+  
+  Future<void> _startHeightHoldWithCountdown(double heightCm) async {
+    _addDebug("Height hold starting in...");
+    
+    // 5 second countdown
+    for (int i = 5; i > 0; i--) {
+      _addDebug("$i");
+      await Future.delayed(const Duration(seconds: 1));
+    }
+    
+    // Activate height hold
+    setState(() {
+      _targetHeight = heightCm / 100.0; // Convert cm to meters
+      _isHeightHoldActive = true;
+    });
+    
+    _addDebug("Height hold ACTIVATED - ${heightCm.toStringAsFixed(0)}cm target");
+    _addDebug("Left stick: normal throttle, Right stick: horizontal");
+    _enableHeightHoldCommander();
+  }
+  
+  Future<void> _enableHeightHoldCommander() async {
+    try {
+      // Enable high-level commander
+      var enablePacket1 = [0x2e, 0x02, 0x00, 0x01, 0x31];
+      _droneComm.sendPacket(enablePacket1);
+      
+      await Future.delayed(const Duration(milliseconds: 200));
+      
+      var enablePacket2 = [0x2f, 0x02, 0x01];
+      _droneComm.sendPacket(enablePacket2);
+      
+      _addDebug("Height hold commander enabled");
+    } catch (e) {
+      _addDebug("Error enabling height hold: $e");
+    }
+  }
+  
+  void _sendHeightHoldPacket() {
+    try {
+      // Fixed target height (no joystick control)
+      // Height is set via popup dialog only
+      
+      // Horizontal movement with right joystick (with trim and increased sensitivity)
+      double trimmedRoll = (roll + rollTrim).clamp(-1.0, 1.0);
+      double trimmedPitch = (pitch + pitchTrim).clamp(-1.0, 1.0);
+      
+      double vx = trimmedPitch * 0.6;  // Forward/backward velocity (increased sensitivity)
+      double vy = -trimmedRoll * 0.6;  // Left/right velocity (increased sensitivity)
+      double yawRate = (yawOn ? yaw : 0.0) * 50.0; // Yaw control if enabled
+      
+      // Create 19-byte hover setpoint packet
+      var packet = <int>[];
+      
+      // Header (1 byte)
+      packet.add(0x7c); // Port 7, Channel 12
+      
+      // Command type (1 byte)
+      packet.add(0x05); // Hover setpoint command
+      
+      // VX - Forward/backward velocity (4 bytes, float32, little-endian)
+      var vxBytes = _floatToLittleEndianBytes(vx);
+      packet.addAll(vxBytes);
+      
+      // VY - Left/right velocity (4 bytes, float32, little-endian)
+      var vyBytes = _floatToLittleEndianBytes(vy);
+      packet.addAll(vyBytes);
+      
+      // Yaw rate (4 bytes, float32, little-endian)
+      var yawBytes = _floatToLittleEndianBytes(yawRate);
+      packet.addAll(yawBytes);
+      
+      // Height (4 bytes, float32, little-endian)
+      var heightBytes = _floatToLittleEndianBytes(_targetHeight);
+      packet.addAll(heightBytes);
+      
+      // Calculate checksum using CORRECT algorithm: sum of all data bytes
+      int checksum = 0;
+      for (int i = 0; i < 18; i++) {
+        checksum += packet[i];
+      }
+      checksum = checksum & 0xFF; // Take lower 8 bits
+      packet.add(checksum);
+      
+      _droneComm.sendPacket(packet);
+      
+    } catch (e) {
+      _addDebug("Error sending height hold packet: $e");
+    }
+  }
+  
+  List<int> _floatToLittleEndianBytes(double value) {
+    var buffer = ByteData(4);
+    buffer.setFloat32(0, value, Endian.little);
+    return buffer.buffer.asUint8List().toList();
+  }
+
+  String _getJoystickLabel(bool isLeftStick) {
+    // Left stick is always THRUST/YAW regardless of height hold mode
+    return isLeftStick ? 'THRUST/YAW' : 'ROLL/PITCH';
+  }
+
+  // Removed _navigateToHeightHoldMode - no longer needed
 
   Future<void> _handleConnectDisconnect() async {
     // Set up connection status callback for heartbeat
@@ -241,9 +513,11 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       _addDebug("Drone UDP socket initialized.");
       if (mounted) {
         setState(() => connected = true);
+        
         _startSendingCommands();
         _addDebug('Connected to drone. Starting arming sequence...');
         _addDebug('Keep joysticks centered during arming.');
+        _addDebug('Blue button (bottom left) = Height Hold Mode');
       }
     } catch (e) {
       _addDebug("Error initializing drone socket: $e");
@@ -307,27 +581,33 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
         return;
       }
 
-      // Scale thrust: App (0.0 to 1.0) -> Protocol (10000 to 60000)
-      // Only apply thrust if armed and thrust > 0
-      int protocolThrust = 0;
-      if (_isArmed && thrust > 0.0) {
-        protocolThrust = (MIN_THRUST + (thrust * (MAX_THRUST - MIN_THRUST))).round();
-      }
-      
-      // Apply trim to roll and pitch, clamp to [-1.0, 1.0]
-      double trimmedRoll = (roll + rollTrim).clamp(-1.0, 1.0);
-      double trimmedPitch = (pitch + pitchTrim).clamp(-1.0, 1.0);
-      double scaledRoll = trimmedRoll * MAX_ROLL_PITCH_ANGLE;
-      double scaledPitch = trimmedPitch * MAX_ROLL_PITCH_ANGLE;
-      double scaledYaw = (yawOn ? yaw : 0.0) * MAX_YAW_RATE;
+      if (_isHeightHoldActive) {
+        // Send height hold commands
+        _sendHeightHoldPacket();
+      } else {
+        // Normal manual commands
+        // Scale thrust: App (0.0 to 1.0) -> Protocol (10000 to 60000)
+        // Only apply thrust if armed and thrust > 0
+        int protocolThrust = 0;
+        if (_isArmed && thrust > 0.0) {
+          protocolThrust = (MIN_THRUST + (thrust * (MAX_THRUST - MIN_THRUST))).round();
+        }
+        
+        // Apply trim to roll and pitch, clamp to [-1.0, 1.0]
+        double trimmedRoll = (roll + rollTrim).clamp(-1.0, 1.0);
+        double trimmedPitch = (pitch + pitchTrim).clamp(-1.0, 1.0);
+        double scaledRoll = trimmedRoll * MAX_ROLL_PITCH_ANGLE;
+        double scaledPitch = trimmedPitch * MAX_ROLL_PITCH_ANGLE;
+        double scaledYaw = (yawOn ? yaw : 0.0) * MAX_YAW_RATE;
 
-      final List<int> packet = _droneComm.createCommanderPacket(
-        roll: scaledRoll,
-        pitch: scaledPitch,
-        yaw: scaledYaw,
-        thrust: protocolThrust,
-      );
-      _droneComm.sendPacket(packet);
+        final List<int> packet = _droneComm.createCommanderPacket(
+          roll: scaledRoll,
+          pitch: scaledPitch,
+          yaw: scaledYaw,
+          thrust: protocolThrust,
+        );
+        _droneComm.sendPacket(packet);
+      }
     });
   }
 
@@ -367,7 +647,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
               shape: BoxShape.circle,
             ),
             child: IconButton(
-              icon: Icon(Icons.swap_horiz, color: yawOn ? Colors.white : Colors.grey[400]),
+              icon: Icon(Icons.swap_horiz, color: yawOn ? Colors.orange : Colors.grey[400]),
               tooltip: "Toggle Yaw",
               onPressed: () {
                 setState(() {
@@ -381,24 +661,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
             ),
           ),
           
-          Expanded(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(
-                    connected 
-                      ? "Connected to: ${currentSsid ?? 'Drone'}"
-                      : "Not Connected to Drone", 
-                    style: TextStyle(
-                      color: connected ? Colors.green[300] : Colors.red[300], 
-                      fontSize: 11,
-                      fontWeight: FontWeight.w500,
-                    ),
-                  textAlign: TextAlign.center,
-                ),
-              ],
-            ),
-          ),
+          const Expanded(child: SizedBox()), // Empty space to center the buttons
 
           Container(
             decoration: BoxDecoration(
@@ -485,6 +748,24 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           voltage != null ? '${voltage.toStringAsFixed(2)} V' : '--',
           style: TextStyle(
             color: textColor,
+            fontSize: 14,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildHeightDisplay() {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(Icons.height, color: Colors.blue, size: 20),
+        const SizedBox(width: 4),
+        Text(
+          '${(_targetHeight * 100).toStringAsFixed(0)} cm',
+          style: const TextStyle(
+            color: Colors.blue,
             fontSize: 14,
             fontWeight: FontWeight.bold,
           ),
@@ -632,7 +913,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
         Padding(
           padding: const EdgeInsets.only(bottom: 8.0),
           child: Text(
-            isLeftStick ? 'THRUST/YAW' : 'ROLL/PITCH',
+            _getJoystickLabel(isLeftStick),
             style: TextStyle(
               color: Colors.white70,
               fontSize: 12,
@@ -1280,36 +1561,57 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                           ],
                         ),
                       ),
-                      // Center Debug Area - Debug + Battery
+                      // Center Debug Area - Debug + Battery (moved up slightly)
                       Expanded(
                         flex: 1,
-                        child: Center(
-                          child: Column(
-                            mainAxisSize: MainAxisSize.min,
-                            children: [
+                        child: Padding(
+                          padding: const EdgeInsets.only(bottom: 80), // Move up even further
+                                                      child: Center(
+                              child: Column(
+                                mainAxisSize: MainAxisSize.min,
+                                children: [
+                                  // Connection status text above debug window
+                                  Text(
+                                    connected 
+                                      ? "Connected to: ${currentSsid ?? 'Drone'}"
+                                      : "Not Connected to Drone", 
+                                    style: TextStyle(
+                                      color: connected ? Colors.white : Colors.grey[400], 
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w500,
+                                    ),
+                                    textAlign: TextAlign.center,
+                                  ),
+                                  const SizedBox(height: 8),
                               Container(
-                                width: 150,
-                                height: 80,
-                                padding: const EdgeInsets.all(4.0),
+                                width: double.infinity,
+                                height: 120, // Increased height
+                                padding: const EdgeInsets.all(8.0), // Increased padding
                                 decoration: BoxDecoration(
-                                  color: Colors.black.withOpacity(0.6),
-                                  borderRadius: BorderRadius.circular(6.0),
-                                  border: Border.all(color: Colors.grey[700]!, width: 1),
+                                  color: Colors.black.withOpacity(0.7), // Slightly darker
+                                  borderRadius: BorderRadius.circular(8.0), // Larger radius
+                                  border: Border.all(color: Colors.grey[600]!, width: 1),
                                 ),
-                                child: Column(
-                                  mainAxisSize: MainAxisSize.min,
-                                  crossAxisAlignment: CrossAxisAlignment.center,
-                                  children: debugLines.take(3).map((line) => 
-                                    Padding(
-                                      padding: const EdgeInsets.symmetric(vertical: 0.5),
-                                      child: Text(line, 
-                                        style: const TextStyle(color: Colors.white70, fontSize: 10),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        textAlign: TextAlign.center,
-                                      ),
-                                    )
-                                  ).toList(),
+                                child: SingleChildScrollView(
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    crossAxisAlignment: CrossAxisAlignment.start, // Left align for better readability
+                                    children: debugLines.take(5).map((line) => // Show 5 lines instead of 3
+                                      Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 1.0), // Increased spacing
+                                        child: Text(
+                                          line, 
+                                          style: const TextStyle(
+                                            color: Colors.white70, 
+                                            fontSize: 11, // Slightly larger font
+                                          ),
+                                          maxLines: null, // Allow multiple lines
+                                          overflow: TextOverflow.visible, // Show full text
+                                          textAlign: TextAlign.left, // Left align
+                                        ),
+                                      )
+                                    ).toList(),
+                                  ),
                                 ),
                               ),
                               const SizedBox(height: 8),
@@ -1317,6 +1619,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                             ],
                           ),
                         ),
+                      ),
                       ),
                       // Right Joystick Area - Roll & Pitch  
                       Expanded(
@@ -1407,6 +1710,75 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 ),
               ],
             ),
+            // Height Hold button - bottom left
+            if (connected)
+              Positioned(
+                bottom: 20,
+                left: 20,
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.grey[800], // Same grey circle as other buttons
+                    shape: BoxShape.circle,
+                  ),
+                  child: IconButton(
+                    icon: Icon(
+                      Icons.height, 
+                      color: _isHeightHoldActive ? Colors.blue : Colors.grey[400], // Blue when active, grey when inactive
+                      size: 28
+                    ),
+                    tooltip: _isHeightHoldActive ? 'Stop Height Hold' : 'Start Height Hold',
+                    onPressed: () {
+                      _toggleHeightHold();
+                    },
+                  ),
+                ),
+              ),
+            // Height display next to height hold button - bottom left
+            if (connected && _isHeightHoldActive)
+              Positioned(
+                bottom: 25,
+                left: 80, // Next to the height hold button
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                  decoration: BoxDecoration(
+                    color: Colors.black.withOpacity(0.7),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: Text(
+                    _isLanding 
+                        ? 'LANDING ${(_targetHeight * 100).toStringAsFixed(0)}cm'
+                        : '${(_targetHeight * 100).toStringAsFixed(0)}cm',
+                    style: TextStyle(
+                      color: _isLanding ? Colors.orange : Colors.blue,
+                      fontSize: 12,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ),
+              ),
+            
+
+            
+            // Emergency Stop button - bottom middle (matching other button styles)
+            if (connected)
+              Positioned(
+                bottom: 20,
+                left: MediaQuery.of(context).size.width / 2 - 24, // Center horizontally (24 = half of 48px button)
+                child: Container(
+                  decoration: BoxDecoration(
+                    color: Colors.grey[800], // Grey background like other buttons
+                    shape: BoxShape.circle,
+                  ),
+                  child: IconButton(
+                    icon: Icon(Icons.stop, color: _emergencyStopPressed ? Colors.red : Colors.grey[400]), // Grey by default, red when pressed
+                    tooltip: 'Emergency Stop',
+                    onPressed: () {
+                      _emergencyStop();
+                    },
+                  ),
+                ),
+              ),
+
             // Slider settings button - bottom right
             Positioned(
               bottom: 20,
@@ -1417,7 +1789,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                   shape: BoxShape.circle,
                 ),
                 child: IconButton(
-                  icon: Icon(Icons.tune, color: Colors.white),
+                  icon: Icon(Icons.tune, color: Colors.grey[400]),
                   tooltip: 'Trim Settings',
                   onPressed: () {
                     _showTrimSettingsRightSheet();

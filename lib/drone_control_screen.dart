@@ -1,14 +1,16 @@
-import 'dart:async'; // Added for Timer
+import 'dart:async'; // Added for Timer and TimeoutException
 import 'dart:math' as math;
 import 'dart:typed_data'; // Added for ByteData
 import 'package:flutter/material.dart';
-import 'package:flutter_joystick/flutter_joystick.dart';
+import 'package:flutter/foundation.dart'; // Added for kDebugMode
+import 'package:flutter/services.dart'; // Added for PlatformException and MissingPluginException
+// Removed unused import: flutter_joystick
 import 'package:network_info_plus/network_info_plus.dart';
-import 'package:url_launcher/url_launcher.dart';
+// import 'package:url_launcher/url_launcher.dart'; // Removed for iOS compatibility
 import 'drone_comm.dart'; // Import the DroneComm class
 // Removed height hold screen import - no longer needed
-import 'package:shared_preferences/shared_preferences.dart';
-import 'package:audioplayers/audioplayers.dart';
+// import 'package:shared_preferences/shared_preferences.dart'; // Removed for iOS compatibility
+// Audio removed for iOS compatibility - audioplayers_darwin causes crashes
 
 class DroneControlScreen extends StatefulWidget {
   const DroneControlScreen({Key? key}) : super(key: key);
@@ -19,14 +21,14 @@ class DroneControlScreen extends StatefulWidget {
 
 class _DroneControlScreenState extends State<DroneControlScreen> {
   final DroneComm _droneComm = DroneComm(); // Instantiate DroneComm
-  final AudioPlayer _audioPlayer = AudioPlayer();
+  // Audio functionality completely removed for iOS compatibility
   Timer? _commandTimer; // Timer for sending commands
   Timer? _armingTimer; // Timer for arming sequence
   Timer? _throttleDecayTimer; // Timer for gradual throttle decay
 
   // Define scaling factors
   static const double MAX_ROLL_PITCH_ANGLE = 30.0; // degrees
-  static const double MAX_YAW_RATE = 200.0;      // degrees/second
+  static const double MAX_YAW_RATE = 50.0;       // degrees/second
   static const int MIN_THRUST = 1000;            // Minimum effective thrust (per protocol)
   static const int MAX_THRUST = 60000;           // Maximum safe thrust (updated from protocol)
   static const double DEFAULT_EXPO_EXPONENT = 1.1; // Default joystick sensitivity
@@ -49,9 +51,17 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   static const double HEIGHT_CHANGE_RATE = 1.0; // Height change rate (m/s)
   static const double LANDING_RATE = 0.3; // Landing descent rate (m/s)
   Timer? _landingTimer; // Timer for smooth landing
+  
+  // Supported drone WiFi network names
+  static const List<String> supportedDroneNetworks = [
+    'litewing',
+    'esp-drone', 
+    'crazyflie'
+  ];
+  
   double rollTrim = 0.0; // Added for roll trim
   double pitchTrim = 0.0; // Added for pitch trim
-  List<String> debugLines = ["Welcome to LiteWing!", "Ready."];
+  List<String> debugLines = ["LiteWing by CircuitDigest", "Ready."];
   String? currentSsid;
   
   // Separate tracking for each joystick to support multi-touch
@@ -75,6 +85,9 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
 
   double? _batteryVoltage;
 
+  /// Audio completely disabled for iOS compatibility
+  bool get _isAudioEnabled => false;
+
   @override
   void initState() {
     super.initState();
@@ -97,52 +110,119 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
     _throttleDecayTimer?.cancel();
     _landingTimer?.cancel();
     _droneComm.close();
+    // Audio functionality completely removed for iOS compatibility
     super.dispose();
+  }
+
+  // Debug logging - disabled in production
+  static const bool _debugLogging = kDebugMode;
+  
+  static void _log(String message) {
+    if (_debugLogging) {
+      debugPrint('DroneControlScreen: $message');
+    }
+  }
+
+  /// Audio functionality removed for iOS compatibility
+  Future<void> _playAudioFile(String assetPath) async {
+    // Audio completely disabled - no-op function
+    _log('Audio disabled for iOS compatibility');
   }
 
   Future<void> _fetchSSID() async {
     final info = NetworkInfo();
     try {
-      final ssid = await info.getWifiName();
+      // Add timeout for iOS network requests to prevent hanging
+      final ssid = await info.getWifiName().timeout(
+        const Duration(seconds: 3),
+        onTimeout: () {
+          _addDebug("Network info request timed out - this is normal on iOS simulator");
+          return null;
+        },
+      );
+      
       if (mounted) {
         setState(() {
           currentSsid = ssid;
         });
       }
+    } on MissingPluginException catch (e) {
+      if (mounted) {
+        setState(() {
+          currentSsid = "Network info not available";
+        });
+      }
+      _addDebug("Network info plugin not available: $e");
+    } on PlatformException catch (e) {
+      String errorMessage;
+      String displayMessage;
+      
+      // Handle iOS-specific WiFi access errors
+      if (e.code == 'location_permission_denied') {
+        errorMessage = "Location permission required to get WiFi name";
+        displayMessage = "Permission required";
+      } else if (e.code == 'location_services_disabled') {
+        errorMessage = "Location services disabled";
+        displayMessage = "Location services needed";
+      } else if (e.code == 'wifi_info_permission_denied') {
+        errorMessage = "WiFi info permission denied - iOS requires location permission";
+        displayMessage = "WiFi access restricted";
+      } else if (e.message?.contains('NEHotspotNetwork') ?? false) {
+        errorMessage = "iOS network helper error - this is expected on first run";
+        displayMessage = "Network detection in progress";
+        // Add specific guidance for iOS network errors
+        _addDebug("iOS Network: First run network detection - grant permissions when prompted");
+      } else {
+        errorMessage = "Platform error: ${e.message}";
+        displayMessage = "Network info unavailable";
+      }
+      
+      if (mounted) {
+        setState(() {
+          currentSsid = displayMessage;
+        });
+      }
+      _addDebug("WiFi info: $errorMessage");
+    } on TimeoutException catch (e) {
+      if (mounted) {
+        setState(() {
+          currentSsid = "Network detection timeout";
+        });
+      }
+      _addDebug("Network detection timed out - this is normal on iOS");
     } catch (e) {
       if (mounted) {
         setState(() {
-          currentSsid = "Error fetching SSID";
+          currentSsid = "WiFi info unavailable";
         });
       }
-      _addDebug("Error fetching SSID: $e");
+      _addDebug("Error fetching WiFi info: $e");
     }
   }
 
   Future<void> _loadTrimValues() async {
-    final prefs = await SharedPreferences.getInstance();
+    // SharedPreferences disabled for iOS compatibility - use defaults
     setState(() {
-      rollTrim = prefs.getDouble('rollTrim') ?? 0.0;
-      pitchTrim = prefs.getDouble('pitchTrim') ?? 0.0;
+      rollTrim = 0.0;
+      pitchTrim = 0.0;
     });
   }
 
   Future<void> _saveTrimValues() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('rollTrim', rollTrim);
-    await prefs.setDouble('pitchTrim', pitchTrim);
+    // SharedPreferences disabled for iOS compatibility - no-op
+    _log('Trim values not saved (iOS compatibility mode)');
   }
 
   Future<void> _loadExpoExponent() async {
-    final prefs = await SharedPreferences.getInstance();
+    // SharedPreferences disabled for iOS compatibility - use default
     setState(() {
-      expoExponent = prefs.getDouble('expoExponent') ?? 1.1;
+      expoExponent = 1.1;
     });
   }
 
   Future<void> _saveExpoExponent() async {
-    final prefs = await SharedPreferences.getInstance();
-    await prefs.setDouble('expoExponent', expoExponent);
+    // SharedPreferences disabled for iOS compatibility - no-op
+    _log('Expo exponent not saved (iOS compatibility mode)');
   }
 
   void _addDebug(String msg) {
@@ -153,18 +233,58 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       });
     }
   }
+  
+  bool _isConnectedToDrone() {
+    if (currentSsid == null) return false;
+    
+    String ssidLower = currentSsid!.toLowerCase();
+    
+    // Debug: Show what network is being checked
+    _addDebug("Checking network: '$currentSsid'");
+    
+    // Check if it's a supported drone network
+    bool isSupported = supportedDroneNetworks.any((network) => ssidLower.contains(network.toLowerCase()));
+    
+    if (!isSupported) {
+      _addDebug("Network '$currentSsid' not recognized as drone network");
+      _addDebug("Supported: ${supportedDroneNetworks.join(', ')}");
+    }
+    
+    return isSupported;
+  }
 
   Future<void> _playConnectSound() async {
-    await _audioPlayer.play(AssetSource('sounds/connected.mp3'), volume: 1.0);
+    await _playAudioFile('sounds/connected.mp3');
   }
 
   Future<void> _playDisconnectSound() async {
-    await _audioPlayer.play(AssetSource('sounds/disconnected.mp3'), volume: 1.0);
+    await _playAudioFile('sounds/disconnected.mp3');
   }
 
   void _requestImmediateVoltage() {
     // Request a single voltage reading immediately
     _droneComm.requestSingleVoltageReading();
+  }
+
+  Future<void> _launchTutorial() async {
+    // URL launcher disabled for iOS compatibility
+    const String tutorialUrl = 'https://circuitdigest.com/articles/litewing-mobile-app-for-esp32-drones-crazyflie-esp-drone';
+    _addDebug("Tutorial URL (iOS compatibility mode):");
+    _addDebug(tutorialUrl);
+    _addDebug("Copy URL to browser to view tutorial");
+  }
+
+  Widget _buildDebugLine(String line) {
+    return Text(
+      line,
+      style: const TextStyle(
+        color: Color(0xFFf1f2f2),
+        fontSize: 11,
+      ),
+      maxLines: null,
+      overflow: TextOverflow.visible,
+      textAlign: TextAlign.left,
+    );
   }
 
 
@@ -268,7 +388,15 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       context: context,
       builder: (context) => StatefulBuilder(
         builder: (context, setDialogState) => AlertDialog(
-          title: const Text('Set Target Height'),
+          backgroundColor: Colors.grey[900],
+          title: const Text(
+            'Set Target Height',
+            style: TextStyle(
+              color: const Color(0xFFf1f2f2),
+              fontSize: 20,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
           content: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
@@ -295,26 +423,54 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 },
               ),
               const SizedBox(height: 10),
-              const Text(
+              Text(
                 '20 cm - 150 cm range',
                 style: TextStyle(
                   fontSize: 12,
-                  color: Colors.grey,
+                  color: Colors.grey[400],
                 ),
               ),
             ],
           ),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.of(context).pop(),
-              child: const Text('Cancel'),
-            ),
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _startHeightHoldWithCountdown(selectedHeight);
-              },
-              child: const Text('Start'),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  style: TextButton.styleFrom(
+                    foregroundColor: Colors.grey[300],
+                    backgroundColor: Colors.grey[700],
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  ),
+                  child: const Text(
+                    'Cancel',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                const SizedBox(width: 12),
+                TextButton(
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    _startHeightHoldWithCountdown(selectedHeight);
+                  },
+                  style: TextButton.styleFrom(
+                    foregroundColor: const Color(0xFFf1f2f2),
+                    backgroundColor: Colors.blue[700],
+                    padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                  ),
+                  child: const Text(
+                    'Start',
+                    style: TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
@@ -325,8 +481,8 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   Future<void> _startHeightHoldWithCountdown(double heightCm) async {
     _addDebug("Height hold starting in...");
     
-    // 5 second countdown
-    for (int i = 5; i > 0; i--) {
+    // 3 second countdown
+    for (int i = 3; i > 0; i--) {
       _addDebug("$i");
       await Future.delayed(const Duration(seconds: 1));
     }
@@ -370,7 +526,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       
       double vx = trimmedPitch * 0.6;  // Forward/backward velocity (increased sensitivity)
       double vy = -trimmedRoll * 0.6;  // Left/right velocity (increased sensitivity)
-      double yawRate = (yawOn ? yaw : 0.0) * 50.0; // Yaw control if enabled
+      double yawRate = (yawOn ? yaw : 0.0) * MAX_YAW_RATE; // Yaw control if enabled
       
       // Create 19-byte hover setpoint packet
       var packet = <int>[];
@@ -443,7 +599,11 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           setState(() {
             _batteryVoltage = null;
             _isArmed = false; // Reset armed state
+            _isHeightHoldActive = false; // Deactivate height hold on connection loss
+            _isLanding = false; // Stop landing sequence
           });
+          // Cancel height hold related timers
+          _landingTimer?.cancel();
         }
       }
     };
@@ -456,7 +616,11 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
         setState(() {
           connected = false;
           _isArmed = false; // Reset armed state
+          _isHeightHoldActive = false; // Deactivate height hold on manual disconnect
+          _isLanding = false; // Stop landing sequence
         });
+        // Cancel height hold related timers
+        _landingTimer?.cancel();
         _addDebug("Disconnected from drone.");
       }
       return;
@@ -464,41 +628,126 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
 
     // Handle Connect
     await _fetchSSID(); // Refresh SSID
-    if (currentSsid == null || !currentSsid!.toLowerCase().contains('litewing')) {
+    if (!_isConnectedToDrone()) {
       if (mounted) {
         showDialog(
           context: context,
           builder: (context) => AlertDialog(
-            title: const Text('Not connected to LiteWing'),
-            content: Text('Please connect to the LiteWing WiFi network to continue. Current: ${currentSsid ?? "Unknown"}'),
-            actions: [
-              TextButton(
-                onPressed: () async {
-                  Navigator.of(context).pop();
-                  const String androidSettingsUri = 'android.settings.WIFI_SETTINGS';
-                  const String iosSettingsUri = 'App-Prefs:root=WIFI';
-                  try {
-                    if (await canLaunchUrl(Uri(scheme: 'intent', path: androidSettingsUri))) {
-                       await launchUrl(Uri(scheme: 'intent', path: androidSettingsUri));
-                    } else if (await canLaunchUrl(Uri.parse(iosSettingsUri))) {
-                       await launchUrl(Uri.parse(iosSettingsUri));
-                    } else {
-                      _addDebug("Could not open WiFi settings automatically.");
-                      if(mounted) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                             const SnackBar(content: Text("Could not open WiFi settings. Please open them manually."))
-                          );
-                      }
-                    }
-                  } catch (e) {
-                     _addDebug("Error opening WiFi settings: $e");
-                  }
-                },
-                child: const Text('Open WiFi Settings'),
+            backgroundColor: Colors.grey[900],
+            title: const Text(
+              'Not connected to drone',
+              style: TextStyle(
+                color: Color(0xFFf1f2f2),
+                fontSize: 20,
+                fontWeight: FontWeight.w600,
               ),
-              TextButton(
-                onPressed: () => Navigator.of(context).pop(),
-                child: const Text('Cancel'),
+            ),
+            content: Text(
+              'Network detection: ${currentSsid ?? "Unknown"}\n\nSupported networks: LiteWing, ESP-DRONE, Crazyflie\n\nIf you\'re connected to a drone WiFi network, use "Force Connect" to bypass iOS network restrictions.',
+              style: const TextStyle(
+                color: Color(0xFFf1f2f2),
+                fontSize: 16,
+              ),
+            ),
+            actions: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  TextButton(
+                    onPressed: () => Navigator.of(context).pop(),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.grey[300],
+                      backgroundColor: Colors.grey[700],
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    ),
+                    child: const Text(
+                      'Cancel',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      // Force connect - bypass network check
+                      _addDebug("Connecting to drone...");
+                      
+                      try {
+                        await _droneComm.connect();
+                        _addDebug("Connected to drone!");
+                        if (mounted) {
+                          setState(() => connected = true);
+                          
+                          _startSendingCommands();
+                          _addDebug('Starting arming sequence...');
+                          _addDebug('Keep joysticks centered during arming.');
+                          _addDebug('Blue button = Height Hold Mode');
+                        }
+                      } catch (e) {
+                        String userFriendlyError = "Connection failed. Check WiFi and drone power.";
+                        _addDebug("Connection error: $userFriendlyError");
+                        if (mounted) {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            SnackBar(
+                              content: Text(userFriendlyError),
+                              backgroundColor: Colors.red[700],
+                              duration: const Duration(seconds: 5),
+                            ),
+                          );
+                        }
+                      }
+                    },
+                    style: TextButton.styleFrom(
+                      foregroundColor: const Color(0xFFf1f2f2),
+                      backgroundColor: Colors.green[700],
+                      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+                    ),
+                    child: const Text(
+                      'Connect to Drone',
+                      style: TextStyle(
+                        fontSize: 15,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  TextButton(
+                    onPressed: () async {
+                      Navigator.of(context).pop();
+                      const String androidSettingsUri = 'android.settings.WIFI_SETTINGS';
+                      const String iosSettingsUri = 'App-Prefs:root=WIFI';
+                      // URL launcher disabled for iOS compatibility
+                      _addDebug("WiFi settings launch disabled (iOS compatibility)");
+                      _addDebug("Please open WiFi settings manually:");
+                      _addDebug("iOS: Settings → Wi-Fi");
+                      _addDebug("Android: Settings → Connections → Wi-Fi");
+                      if(mounted) {
+                        ScaffoldMessenger.of(context).showSnackBar(
+                          SnackBar(
+                            content: const Text("Please open WiFi settings manually (iOS compatibility mode)"),
+                            backgroundColor: Colors.orange[700],
+                            duration: const Duration(seconds: 4),
+                          ),
+                        );
+                      }
+                    },
+                    style: TextButton.styleFrom(
+                      foregroundColor: const Color(0xFFf1f2f2),
+                      backgroundColor: Colors.blue[700],
+                      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    ),
+                    child: const Text(
+                      'WiFi Settings',
+                      style: TextStyle(
+                        fontSize: 14,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -520,11 +769,33 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
         _addDebug('Blue button (bottom left) = Height Hold Mode');
       }
     } catch (e) {
-      _addDebug("Error initializing drone socket: $e");
+      String userFriendlyError;
+      if (e.toString().contains('Port') && e.toString().contains('already in use')) {
+        userFriendlyError = "Port already in use. Please close other drone control apps and try again.";
+      } else if (e.toString().contains('Permission denied')) {
+        userFriendlyError = "Network permission denied. Please check app permissions.";
+      } else if (e.toString().contains('Network unreachable')) {
+        userFriendlyError = "Cannot reach drone. Check WiFi connection to drone network.";
+      } else if (e.toString().contains('connection')) {
+        userFriendlyError = "Connection failed. Ensure drone is powered on and WiFi is connected.";
+      } else {
+        userFriendlyError = "Connection error. Check WiFi connection and drone power.";
+      }
+      
+      _addDebug("Connection error: $userFriendlyError");
       if (mounted) {
         setState(() => connected = false); // Ensure not connected if socket fails
-         ScaffoldMessenger.of(context).showSnackBar(
-            SnackBar(content: Text("Error connecting to drone: $e. Check WiFi & drone power."))
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(userFriendlyError),
+            backgroundColor: Colors.red[700],
+            duration: const Duration(seconds: 5),
+            action: SnackBarAction(
+              label: 'Retry',
+              textColor: const Color(0xFFf1f2f2),
+              onPressed: () => _handleConnectDisconnect(),
+            ),
+          ),
         );
       }
     }
@@ -661,7 +932,16 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
             ),
           ),
           
-          const Expanded(child: SizedBox()), // Empty space to center the buttons
+          // Center Logo
+          Expanded(
+            child: Center(
+              child: Image.asset(
+                'assets/pics/main_logo_(400x120)-01.png',
+                height: 48,
+                fit: BoxFit.contain,
+              ),
+            ),
+          ),
 
           Container(
             decoration: BoxDecoration(
@@ -694,8 +974,9 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           ...debugLines.map((line) => 
             Padding(
               padding: const EdgeInsets.symmetric(vertical: 0.5),
-              child: Text(line, 
-                style: const TextStyle(color: Colors.white70, fontSize: 8),
+              child: Text(
+                line,
+                style: const TextStyle(color: Color(0xFFf1f2f2), fontSize: 8),
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 textAlign: TextAlign.center,
@@ -716,15 +997,15 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
     final voltage = _batteryVoltage;
     if (voltage == null) {
       batteryIcon = Icons.battery_unknown;
-      iconColor = Colors.white;
+      iconColor = const Color(0xFFf1f2f2);
       textColor = Colors.grey;
     } else if (voltage >= 4.0) {
       batteryIcon = Icons.battery_full;
-      iconColor = voltage < 3.8 ? Colors.red : Colors.white;
+      iconColor = voltage < 3.8 ? Colors.red : const Color(0xFFf1f2f2);
       textColor = voltage < 3.8 ? Colors.red : Colors.grey;
     } else if (voltage >= 3.8) {
       batteryIcon = Icons.battery_5_bar;
-      iconColor = Colors.white;
+      iconColor = const Color(0xFFf1f2f2);
       textColor = Colors.grey;
     } else if (voltage >= 3.6) {
       batteryIcon = Icons.battery_3_bar;
@@ -888,7 +1169,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                 ),
                                 boxShadow: [
                                   BoxShadow(
-                                    color: Colors.black.withOpacity(0.3),
+                                    color: Color(0xFF000000).withOpacity(0.3),
                                     blurRadius: 4,
                                     offset: Offset(0, 2),
                                   ),
@@ -915,7 +1196,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           child: Text(
             _getJoystickLabel(isLeftStick),
             style: TextStyle(
-              color: Colors.white70,
+              color: Color(0xFFf1f2f2).withOpacity(0.7),
               fontSize: 12,
               fontWeight: FontWeight.bold,
             ),
@@ -1042,8 +1323,8 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       
       final elapsed = DateTime.now().difference(_thrustReleaseTime!);
       
-      // Start decay immediately - gradually decrease to zero over 1.5 seconds
-      const totalDecayDuration = 1500; // 1.5 seconds to decay to zero
+      // Start decay immediately - gradually decrease to zero over 0.75 seconds
+      const totalDecayDuration = 750; // 0.75 seconds to decay to zero
       
       if (elapsed.inMilliseconds >= totalDecayDuration) {
         // Decay complete
@@ -1075,7 +1356,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
       context: context,
       barrierDismissible: true,
       barrierLabel: MaterialLocalizations.of(context).modalBarrierDismissLabel,
-      barrierColor: Colors.black54,
+                             barrierColor: Color(0xFF000000).withOpacity(0.54),
       transitionDuration: const Duration(milliseconds: 300),
       pageBuilder: (context, animation, secondaryAnimation) {
         return StatefulBuilder(
@@ -1108,7 +1389,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                             const Expanded(
                               child: Text(
                                 'Pitch & Roll Settings',
-                                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: Colors.white),
+                                style: TextStyle(fontSize: 16, fontWeight: FontWeight.w600, color: const Color(0xFFf1f2f2)),
                                 textAlign: TextAlign.center,
                               ),
                             ),
@@ -1118,7 +1399,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                 _saveExpoExponent();
                                 Navigator.pop(context);
                               },
-                              child: const Text('SAVE', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Colors.white)),
+                              child: const Text('SAVE', style: TextStyle(fontSize: 14, fontWeight: FontWeight.w600, color: Color(0xFFf1f2f2))),
                             ),
                           ],
                         ),
@@ -1215,7 +1496,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                   style: const TextStyle(
                     fontWeight: FontWeight.w600, 
                     fontSize: 13,
-                    color: Colors.white,
+                    color: Color(0xFFf1f2f2),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -1298,12 +1579,12 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
           children: [
             Row(
               children: [
-                const Text(
+                Text(
                   'Joystick Sensitivity',
                   style: TextStyle(
                     fontWeight: FontWeight.w600, 
                     fontSize: 13,
-                    color: Colors.black87,
+                    color: Color(0xFF000000).withOpacity(0.87),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -1379,7 +1660,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                   style: TextStyle(
                     fontWeight: FontWeight.w600, 
                     fontSize: 13,
-                    color: Colors.white,
+                    color: Color(0xFFf1f2f2),
                   ),
                 ),
                 const SizedBox(width: 6),
@@ -1459,7 +1740,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: Colors.black,
+      backgroundColor: const Color(0xFF000000),
       body: SafeArea(
         child: Stack(
           children: [
@@ -1561,65 +1842,97 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                           ],
                         ),
                       ),
-                      // Center Debug Area - Debug + Battery (moved up slightly)
+                      // Center Debug Area - Perfectly centered with Connection + Debug + Battery
                       Expanded(
                         flex: 1,
-                        child: Padding(
-                          padding: const EdgeInsets.only(bottom: 80), // Move up even further
-                                                      child: Center(
-                              child: Column(
+                        child: Center(
+                          child: Column(
+                            mainAxisSize: MainAxisSize.min,
+                            mainAxisAlignment: MainAxisAlignment.center,
+                            children: [
+                              // Connection status text above debug window
+                              Column(
                                 mainAxisSize: MainAxisSize.min,
                                 children: [
-                                  // Connection status text above debug window
                                   Text(
                                     connected 
                                       ? "Connected to: ${currentSsid ?? 'Drone'}"
                                       : "Not Connected to Drone", 
                                     style: TextStyle(
-                                      color: connected ? Colors.white : Colors.grey[400], 
+                                      color: connected ? const Color(0xFFf1f2f2) : Colors.grey[400], 
                                       fontSize: 12,
                                       fontWeight: FontWeight.w500,
                                     ),
                                     textAlign: TextAlign.center,
                                   ),
-                                  const SizedBox(height: 8),
+                                  if (!connected) ...[
+                                    const SizedBox(height: 4),
+                                    GestureDetector(
+                                      onTap: _launchTutorial,
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                                        decoration: BoxDecoration(
+                                          borderRadius: BorderRadius.circular(12),
+                                          color: Colors.transparent,
+                                        ),
+                                        child: Row(
+                                          mainAxisSize: MainAxisSize.min,
+                                          mainAxisAlignment: MainAxisAlignment.center,
+                                          children: [
+                                            Icon(
+                                              Icons.link,
+                                              size: 14,
+                                              color: Colors.blue[400],
+                                            ),
+                                            const SizedBox(width: 4),
+                                            Text(
+                                              "How to Fly",
+                                              style: TextStyle(
+                                                color: Colors.blue[400],
+                                                fontSize: 11,
+                                                fontWeight: FontWeight.w500,
+                                              ),
+                                            ),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                              const SizedBox(height: 12), // Slightly more space above debug window
+                              
+                              // Debug Window - Centered
                               Container(
                                 width: double.infinity,
-                                height: 120, // Increased height
-                                padding: const EdgeInsets.all(8.0), // Increased padding
+                                height: 120,
+                                padding: const EdgeInsets.all(8.0),
                                 decoration: BoxDecoration(
-                                  color: Colors.black.withOpacity(0.7), // Slightly darker
-                                  borderRadius: BorderRadius.circular(8.0), // Larger radius
+                                  color: Color(0xFF000000).withOpacity(0.7),
+                                  borderRadius: BorderRadius.circular(8.0),
                                   border: Border.all(color: Colors.grey[600]!, width: 1),
                                 ),
                                 child: SingleChildScrollView(
                                   child: Column(
                                     mainAxisSize: MainAxisSize.min,
-                                    crossAxisAlignment: CrossAxisAlignment.start, // Left align for better readability
-                                    children: debugLines.take(5).map((line) => // Show 5 lines instead of 3
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: debugLines.take(5).map((line) =>
                                       Padding(
-                                        padding: const EdgeInsets.symmetric(vertical: 1.0), // Increased spacing
-                                        child: Text(
-                                          line, 
-                                          style: const TextStyle(
-                                            color: Colors.white70, 
-                                            fontSize: 11, // Slightly larger font
-                                          ),
-                                          maxLines: null, // Allow multiple lines
-                                          overflow: TextOverflow.visible, // Show full text
-                                          textAlign: TextAlign.left, // Left align
-                                        ),
+                                        padding: const EdgeInsets.symmetric(vertical: 1.0),
+                                        child: _buildDebugLine(line),
                                       )
                                     ).toList(),
                                   ),
                                 ),
                               ),
-                              const SizedBox(height: 8),
+                              
+                              const SizedBox(height: 12), // Space between debug window and battery
+                              
+                              // Battery Display - Below debug window
                               _buildBatteryDisplay(),
                             ],
                           ),
                         ),
-                      ),
                       ),
                       // Right Joystick Area - Roll & Pitch  
                       Expanded(
@@ -1646,7 +1959,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                       Text(
                                         '${_getActualRollValue().toStringAsFixed(0)}°',
                                         style: const TextStyle(
-                                          color: Colors.white,
+                                          color: Color(0xFFf1f2f2),
                                           fontSize: 16,
                                           fontWeight: FontWeight.bold,
                                         ),
@@ -1667,7 +1980,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                                       Text(
                                         '${_getActualPitchValue().toStringAsFixed(0)}°',
                                         style: const TextStyle(
-                                          color: Colors.white,
+                                          color: Color(0xFFf1f2f2),
                                           fontSize: 16,
                                           fontWeight: FontWeight.bold,
                                         ),
@@ -1710,29 +2023,28 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 ),
               ],
             ),
-            // Height Hold button - bottom left
-            if (connected)
-              Positioned(
-                bottom: 20,
-                left: 20,
-                child: Container(
-                  decoration: BoxDecoration(
-                    color: Colors.grey[800], // Same grey circle as other buttons
-                    shape: BoxShape.circle,
+            // Height Hold button - bottom left (always visible)
+            Positioned(
+              bottom: 20,
+              left: 20,
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.grey[800], // Same grey circle as other buttons
+                  shape: BoxShape.circle,
+                ),
+                child: IconButton(
+                  icon: Icon(
+                    Icons.height, 
+                    color: _isHeightHoldActive ? Colors.blue : Colors.grey[400], // Blue when active, grey when inactive
+                    size: 28
                   ),
-                  child: IconButton(
-                    icon: Icon(
-                      Icons.height, 
-                      color: _isHeightHoldActive ? Colors.blue : Colors.grey[400], // Blue when active, grey when inactive
-                      size: 28
-                    ),
-                    tooltip: _isHeightHoldActive ? 'Stop Height Hold' : 'Start Height Hold',
-                    onPressed: () {
-                      _toggleHeightHold();
-                    },
-                  ),
+                  tooltip: _isHeightHoldActive ? 'Stop Height Hold' : 'Start Height Hold',
+                  onPressed: connected ? () {
+                    _toggleHeightHold();
+                  } : null, // Disable when not connected
                 ),
               ),
+            ),
             // Height display next to height hold button - bottom left
             if (connected && _isHeightHoldActive)
               Positioned(
@@ -1741,7 +2053,7 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
                 child: Container(
                   padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                   decoration: BoxDecoration(
-                    color: Colors.black.withOpacity(0.7),
+                    color: Color(0xFF000000).withOpacity(0.7),
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: Text(
@@ -1759,11 +2071,11 @@ class _DroneControlScreenState extends State<DroneControlScreen> {
             
 
             
-            // Emergency Stop button - bottom middle (matching other button styles)
+            // Emergency Stop button - center left (matching other button styles)
             if (connected)
               Positioned(
-                bottom: 20,
-                left: MediaQuery.of(context).size.width / 2 - 24, // Center horizontally (24 = half of 48px button)
+                left: 20,
+                top: MediaQuery.of(context).size.height / 2 - 24, // Center vertically (24 = half of 48px button)
                 child: Container(
                   decoration: BoxDecoration(
                     color: Colors.grey[800], // Grey background like other buttons
@@ -1808,7 +2120,7 @@ class JoystickGridPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     final paint = Paint()
-      ..color = Colors.white.withOpacity(0.2)
+      ..color = Color(0xFFf1f2f2).withOpacity(0.2)
       ..strokeWidth = 1.0
       ..style = PaintingStyle.stroke;
 

@@ -1,6 +1,6 @@
 import 'dart:io';
-import 'dart:typed_data';
 import 'dart:async';
+import 'package:flutter/foundation.dart';
 
 class DroneComm {
   RawDatagramSocket? _socket;
@@ -18,7 +18,6 @@ class DroneComm {
 
   // --- Voltage Monitoring ---
   Timer? _voltageTimer;
-  double? _lastVoltage;
   Function(double voltage)? onVoltageUpdate;
 
   // --- Height Sensor Detection ---
@@ -26,11 +25,26 @@ class DroneComm {
   Completer<bool>? _heightDetectionCompleter;
   Function(bool hasHeightSensor)? onHeightSensorDetected;
 
+  // Debug logging - disabled in production
+  static const bool _debugLogging = kDebugMode;
+  
+  static void _log(String message) {
+    if (_debugLogging) {
+      debugPrint('DroneComm: $message');
+    }
+  }
+
   Future<void> connect() async {
     try {
       _droneIp = InternetAddress('192.168.43.42');
+      
+      // iOS-specific socket configuration for better reliability
       _socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, _localPort);
       if (_socket != null) {
+        // Configure socket for iOS network requirements
+        _socket!.broadcastEnabled = true;
+        _socket!.multicastHops = 1;
+        
         _socket!.listen((RawSocketEvent event) {
           if (event == RawSocketEvent.read) {
             _handleIncomingData();
@@ -38,9 +52,32 @@ class DroneComm {
         });
         _startConnectionMonitoring();
       }
+    } on SocketException catch (e) {
+      String errorMessage;
+      if (e.osError?.errorCode == 98 || e.osError?.errorCode == 10048) {
+        // Address already in use (Linux/Windows)
+        errorMessage = 'Port $_localPort is already in use. Please close other drone control apps and try again.';
+      } else if (e.osError?.errorCode == 13 || e.osError?.errorCode == 10013) {
+        // Permission denied
+        errorMessage = 'Permission denied. Please check your network permissions and try again.';
+      } else if (e.osError?.errorCode == 101 || e.osError?.errorCode == 10051) {
+        // Network unreachable
+        errorMessage = 'Network unreachable. Please check your WiFi connection and ensure you\'re connected to a drone network.';
+      } else if (e.osError?.errorCode == 48) {
+        // iOS-specific: Address already in use
+        errorMessage = 'Network port already in use. Please close other apps that might be using the network and try again.';
+      } else if (e.osError?.errorCode == 1) {
+        // iOS-specific: Operation not permitted
+        errorMessage = 'Network access not permitted. Please check your network permissions and WiFi connection.';
+      } else {
+        errorMessage = 'Failed to connect to drone: ${e.message}. Please check your network connection.';
+      }
+      _log('Socket error: $errorMessage');
+      throw Exception(errorMessage);
     } catch (e) {
-      print('DroneComm: Error binding socket: $e');
-      rethrow; // Allow UI to catch and display
+      String errorMessage = 'Unable to initialize drone connection: ${e.toString()}. Please check your network settings.';
+      _log('Error binding socket: $errorMessage');
+      throw Exception(errorMessage);
     }
   }
 
@@ -72,14 +109,15 @@ class DroneComm {
       var stopLog = [0x5d, 0x04, 0x01, 0x62];
       _socket!.send(Uint8List.fromList(stopLog), _droneIp!, _dronePort);
     } catch (e) {
-      print('DroneComm: Error requesting voltage: $e');
+      _log('Error requesting voltage (non-critical): $e');
+      // Don't rethrow - voltage monitoring is not critical for flight
     }
   }
 
   // --- Height Sensor Detection ---
   Future<bool> detectHeightSensor() async {
     if (_socket == null || _droneIp == null) {
-      print('DroneComm: Cannot detect height sensor - socket not ready');
+      _log('Cannot detect height sensor - socket not ready');
       return false;
     }
     
@@ -92,7 +130,7 @@ class DroneComm {
         try {
           _heightDetectionCompleter!.complete(false);
         } catch (e) {
-          print('DroneComm: Error completing previous detection: $e');
+          _log('Error completing previous detection: $e');
         }
       }
       _heightDetectionCompleter = null;
@@ -102,16 +140,16 @@ class DroneComm {
     _heightDetectionCompleter = Completer<bool>();
     
     try {
-      print('DroneComm: Starting height sensor detection...');
+      _log('Starting height sensor detection...');
       
       // Try multiple detection attempts for reliability
       for (int attempt = 1; attempt <= 3; attempt++) {
-        print('DroneComm: Detection attempt $attempt/3');
+        _log('Detection attempt $attempt/3');
         
         // Send parameter discovery packet for height sensor
         var heightDetectionPacket = [0x2d, 0x02, 0x00, 0x2f];
         _socket!.send(Uint8List.fromList(heightDetectionPacket), _droneIp!, _dronePort);
-        print('DroneComm: Sent detection packet: [${heightDetectionPacket.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+        _log('Sent detection packet: [${heightDetectionPacket.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
         
         // Wait between attempts
         if (attempt < 3) {
@@ -123,16 +161,16 @@ class DroneComm {
       bool result = await _heightDetectionCompleter!.future.timeout(
         const Duration(seconds: 5), // Increased timeout
         onTimeout: () {
-          print('DroneComm: Height sensor detection timeout after 5 seconds');
+          _log('Height sensor detection timeout after 5 seconds');
           return false;
         },
       );
       
-      print('DroneComm: Final detection result: $result');
+      _log('Final detection result: $result');
       return result;
       
     } catch (e) {
-      print('DroneComm: Error detecting height sensor: $e');
+      _log('Error detecting height sensor: $e');
       return false;
     } finally {
       // Clean up completer
@@ -151,8 +189,13 @@ class DroneComm {
 
   Future<void> _sendPing() async {
     if (_socket == null || _droneIp == null) return;
-    var packet = Uint8List.fromList([0xfd, 0x00, 0xfd]);
-    _socket!.send(packet, _droneIp!, _dronePort);
+    try {
+      var packet = Uint8List.fromList([0xfd, 0x00, 0xfd]);
+      _socket!.send(packet, _droneIp!, _dronePort);
+    } catch (e) {
+      _log('Error sending ping (non-critical): $e');
+      // Don't rethrow - ping failures are handled by connection monitoring
+    }
   }
 
   void _handleIncomingData() {
@@ -162,16 +205,16 @@ class DroneComm {
         _parseIncomingPacket(datagram.data);
       }
     } catch (e) {
-      print('DroneComm: Error handling incoming data: $e');
+      _log('Error handling incoming data: $e');
     }
   }
 
   void _parseIncomingPacket(Uint8List data) {
     if (data.isEmpty) return;
     
-    // Print all incoming packets for debugging height sensor detection
+    // Debug logging for development
     if (data.length >= 3 && data[0] == 0x2d) {
-      print('DroneComm: Received parameter packet: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+      _log('Received parameter packet: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
     }
     
     int header = data[0];
@@ -206,17 +249,16 @@ class DroneComm {
           byteData.setUint8(i, voltageBytes[i]);
         }
         double voltage = byteData.getFloat32(0, Endian.little);
-        _lastVoltage = voltage;
         if (onVoltageUpdate != null) onVoltageUpdate!(voltage);
       }
     } catch (e) {
-      print('DroneComm: Error parsing voltage data: $e');
+      _log('Error parsing voltage data: $e');
     }
   }
 
   void _parseHeightSensorResponse(Uint8List data) {
     try {
-      print('DroneComm: Processing height sensor response: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
+      _log('Processing height sensor response: [${data.map((e) => '0x${e.toRadixString(16).padLeft(2, '0')}').join(', ')}]');
       
       // Expected format: [0x2d, 0x02, 0x00, 0x00, sensor_status, ...]
       // But also handle variations in response format
@@ -224,20 +266,20 @@ class DroneComm {
         int sensorStatus = data[4];
         bool hasHeightSensor = sensorStatus == 0x01;
         
-        print('DroneComm: Height sensor status byte: 0x${sensorStatus.toRadixString(16).padLeft(2, '0')} = ${hasHeightSensor ? "DETECTED" : "NOT FOUND"}');
+        _log('Height sensor status byte: 0x${sensorStatus.toRadixString(16).padLeft(2, '0')} = ${hasHeightSensor ? "DETECTED" : "NOT FOUND"}');
         
         _heightSensorDetected = hasHeightSensor;
         
         // Complete the detection future safely
         if (_heightDetectionCompleter != null && !_heightDetectionCompleter!.isCompleted) {
-          print('DroneComm: Completing height sensor detection with result: $hasHeightSensor');
+          _log('Completing height sensor detection with result: $hasHeightSensor');
           try {
             _heightDetectionCompleter!.complete(hasHeightSensor);
           } catch (e) {
-            print('DroneComm: Error completing detection: $e');
+            _log('Error completing detection: $e');
           }
         } else {
-          print('DroneComm: Detection completer is null or already completed');
+          _log('Detection completer is null or already completed');
         }
         
         // Notify callback
@@ -245,20 +287,20 @@ class DroneComm {
           try {
             onHeightSensorDetected!(hasHeightSensor);
           } catch (e) {
-            print('DroneComm: Error in height sensor callback: $e');
+            _log('Error in height sensor callback: $e');
           }
         }
       } else {
-        print('DroneComm: Height sensor response too short: ${data.length} bytes');
+        _log('Height sensor response too short: ${data.length} bytes');
       }
     } catch (e) {
-      print('DroneComm: Error parsing height sensor response: $e');
+      _log('Error parsing height sensor response: $e');
       // Complete with false on error, but safely
       if (_heightDetectionCompleter != null && !_heightDetectionCompleter!.isCompleted) {
         try {
           _heightDetectionCompleter!.complete(false);
         } catch (completionError) {
-          print('DroneComm: Error completing detection on error: $completionError');
+          _log('Error completing detection on error: $completionError');
         }
       }
     }
@@ -288,12 +330,16 @@ class DroneComm {
       try {
         _heightDetectionCompleter!.complete(false);
       } catch (e) {
-        print('DroneComm: Error completing detection during close: $e');
+        _log('Error completing detection during close: $e');
       }
     }
     _heightDetectionCompleter = null;
     
-    _socket?.close();
+    try {
+      _socket?.close();
+    } catch (e) {
+      _log('Error closing socket: $e');
+    }
     _socket = null;
     _isDroneConnected = false;
     _heightSensorDetected = null; // Reset detection state
@@ -302,7 +348,7 @@ class DroneComm {
   List<int> createCommanderPacket({
     required double roll,    // -30 to 30 degrees
     required double pitch,   // -30 to 30 degrees (will be inverted)
-    required double yaw,     // -200 to 200 degrees/second
+    required double yaw,     // -50 to 50 degrees/second
     required int thrust,    // 0 to 65535
   }) {
     var buffer = ByteData(16); // Header (1) + R(4) + P(4) + Y(4) + Thrust(2) + Checksum (1) = 16 bytes
@@ -346,7 +392,7 @@ class DroneComm {
     try {
       _socket!.send(packet, _droneIp!, _dronePort);
     } catch (e) {
-      print('DroneComm: Error sending packet: $e');
+      _log('Error sending packet: $e');
     }
   }
 }
